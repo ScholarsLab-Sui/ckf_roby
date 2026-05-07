@@ -1,0 +1,25 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor/OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Local data artifacts too large for standard GitHub storage.
+algo/episode_00000.parquet

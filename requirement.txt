@@ -1,0 +1,12 @@
+draccus==0.11.5
+#numpy==2.3.2
+opencv_python==4.11.0.86
+pandas==2.3.1
+plotly==6.1.2
+pyarrow==20.0.0
+pynput==1.8.1
+pyrealsense2==2.55.1.6486
+rerun==1.0.30
+#scipy==1.16.1
+spnav==0.9
+streamlit==1.46.0
