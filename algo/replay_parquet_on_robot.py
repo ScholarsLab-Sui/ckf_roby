@@ -42,11 +42,46 @@ def compute_delta_from_state(
 
 
 def clip_delta(dpos: np.ndarray, drot: np.ndarray, pos_clip: float, rot_clip: float) -> tuple[np.ndarray, np.ndarray]:
-    dpos = np.clip(dpos, -pos_clip, pos_clip)
+    dpos = np.asarray(dpos, dtype=np.float64).copy()
+    drot = np.asarray(drot, dtype=np.float64).copy()
+    if pos_clip > 0:
+        dpos = np.clip(dpos, -pos_clip, pos_clip)
     n = float(np.linalg.norm(drot))
-    if n > rot_clip and n > 1e-12:
+    if rot_clip > 0 and n > rot_clip and n > 1e-12:
         drot = drot * (rot_clip / n)
     return dpos, drot
+
+
+def delta_substep_count(dpos: np.ndarray, drot: np.ndarray, pos_clip: float, rot_clip: float) -> int:
+    substeps = 1
+    if pos_clip > 0:
+        max_pos = float(np.max(np.abs(dpos)))
+        if max_pos > pos_clip:
+            substeps = max(substeps, int(np.ceil(max_pos / pos_clip)))
+
+    rot_norm = float(np.linalg.norm(drot))
+    if rot_clip > 0 and rot_norm > rot_clip:
+        substeps = max(substeps, int(np.ceil(rot_norm / rot_clip)))
+
+    return substeps
+
+
+def command_delta(
+    dpos: np.ndarray,
+    drot: np.ndarray,
+    pos_clip: float,
+    rot_clip: float,
+    clip_mode: str,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    if clip_mode == "truncate":
+        clipped_dpos, clipped_drot = clip_delta(dpos, drot, pos_clip, rot_clip)
+        return clipped_dpos, clipped_drot, 1
+
+    if clip_mode != "subdivide":
+        raise ValueError(f"Unsupported clip_mode={clip_mode}")
+
+    substeps = delta_substep_count(dpos, drot, pos_clip, rot_clip)
+    return dpos / substeps, drot / substeps, substeps
 
 
 def compose_quat(cur_xyzw: np.ndarray, drot: np.ndarray, rot_order: str) -> np.ndarray:
@@ -77,6 +112,11 @@ def load_parquet_states(parquet_path: Path) -> tuple[np.ndarray, np.ndarray]:
     return state, gw
 
 
+def parquet_action_columns(parquet_path: Path) -> list[str]:
+    schema = pq.ParquetFile(str(parquet_path)).schema_arrow
+    return [name for name in schema.names if "action" in name.lower()]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Replay raw ba20260427 parquet on FR3 for mapping diagnosis")
     parser.add_argument("--parquet", required=True, help="Path to raw parquet episode")
@@ -84,8 +124,24 @@ def main() -> None:
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--steps", type=int, default=80)
     parser.add_argument("--hz", type=float, default=3.0)
-    parser.add_argument("--pos-clip", type=float, default=0.002, help="Max |dpos| per axis in meters")
-    parser.add_argument("--rot-clip", type=float, default=0.03, help="Max rotvec norm in radians")
+    parser.add_argument(
+        "--pos-clip",
+        type=float,
+        default=0.002,
+        help="Max |dpos| per command axis in meters; <=0 disables position limiting",
+    )
+    parser.add_argument(
+        "--rot-clip",
+        type=float,
+        default=0.03,
+        help="Max rotvec norm per command in radians; <=0 disables rotation limiting",
+    )
+    parser.add_argument(
+        "--clip-mode",
+        default="subdivide",
+        choices=["subdivide", "truncate"],
+        help="subdivide preserves total delta; truncate reproduces old clipping behavior",
+    )
     parser.add_argument(
         "--rot-order",
         default="current_delta",
@@ -131,6 +187,7 @@ def main() -> None:
     if not parquet_path.is_file():
         raise FileNotFoundError(f"parquet not found: {parquet_path}")
 
+    action_cols = parquet_action_columns(parquet_path)
     state, _ = load_parquet_states(parquet_path)
     if state.shape[0] < 2:
         raise RuntimeError("Need at least 2 frames in parquet")
@@ -143,7 +200,8 @@ def main() -> None:
     print("[replay] mode", "DRY-RUN" if args.dry_run else "LIVE")
     print("[replay] rot_order", args.rot_order, "invert_rot", args.invert_rot, "disable_rot", args.disable_rot)
     print("[replay] quat parquet", args.parquet_quat_format, "robot", args.robot_quat_format)
-    print("[replay] clip pos", args.pos_clip, "rot", args.rot_clip, "hz", args.hz)
+    print("[replay] action columns", action_cols if action_cols else "NONE")
+    print("[replay] clip pos", args.pos_clip, "rot", args.rot_clip, "mode", args.clip_mode, "hz", args.hz)
     print(
         "[replay] gripper th(open/close)",
         args.gripper_open_th,
@@ -155,18 +213,69 @@ def main() -> None:
     )
 
     if args.dry_run:
-        # Fast diagnostics: print first 10 deltas
-        for i in range(start, min(start + 10, end)):
-            dpos, drot = compute_delta_from_state(
+        raw_total = np.zeros(3, dtype=np.float64)
+        command_total = np.zeros(3, dtype=np.float64)
+        total_commands = 0
+        limited_steps = 0
+        max_substeps = 1
+
+        for i in range(start, end):
+            raw_dpos, raw_drot = compute_delta_from_state(
                 state[i],
                 state[i + 1],
                 quat_format=args.parquet_quat_format,
                 invert_rot=args.invert_rot,
             )
-            dpos, drot = clip_delta(dpos, drot, args.pos_clip, args.rot_clip)
             if args.disable_rot:
-                drot[:] = 0.0
-            print(f"[delta {i}] dpos={dpos} drot={drot} |norm(drot)|={np.linalg.norm(drot):.6f}")
+                raw_drot[:] = 0.0
+
+            dpos, drot, substeps = command_delta(
+                raw_dpos,
+                raw_drot,
+                pos_clip=args.pos_clip,
+                rot_clip=args.rot_clip,
+                clip_mode=args.clip_mode,
+            )
+            raw_total += raw_dpos
+            command_total += dpos * substeps
+            total_commands += substeps
+            max_substeps = max(max_substeps, substeps)
+            if substeps > 1 or not (np.allclose(raw_dpos, dpos) and np.allclose(raw_drot, drot)):
+                limited_steps += 1
+
+        # Fast diagnostics: print first 10 deltas
+        for i in range(start, min(start + 10, end)):
+            raw_dpos, raw_drot = compute_delta_from_state(
+                state[i],
+                state[i + 1],
+                quat_format=args.parquet_quat_format,
+                invert_rot=args.invert_rot,
+            )
+            if args.disable_rot:
+                raw_drot[:] = 0.0
+            dpos, drot, substeps = command_delta(
+                raw_dpos,
+                raw_drot,
+                pos_clip=args.pos_clip,
+                rot_clip=args.rot_clip,
+                clip_mode=args.clip_mode,
+            )
+            print(
+                f"[delta {i}] raw_dpos={raw_dpos} cmd_dpos={dpos} substeps={substeps} "
+                f"cmd_drot={drot} |norm(cmd_drot)|={np.linalg.norm(drot):.6f}"
+            )
+        print("[summary] raw_total_m", raw_total, "raw_total_cm", raw_total * 100.0)
+        print("[summary] command_total_m", command_total, "command_total_cm", command_total * 100.0)
+        print(
+            "[summary] replay_steps",
+            end - start,
+            "robot_commands",
+            total_commands,
+            "limited_steps",
+            limited_steps,
+            "max_substeps",
+            max_substeps,
+        )
         print("[replay] dry-run done")
         return
 
@@ -207,22 +316,21 @@ def main() -> None:
 
     try:
         for i in range(start, end):
-            dpos, drot = compute_delta_from_state(
+            raw_dpos, raw_drot = compute_delta_from_state(
                 state[i],
                 state[i + 1],
                 quat_format=args.parquet_quat_format,
                 invert_rot=args.invert_rot,
             )
-            dpos, drot = clip_delta(dpos, drot, args.pos_clip, args.rot_clip)
             if args.disable_rot:
-                drot[:] = 0.0
-
-            rs = robot.read_state()
-            cur = np.asarray(rs.end_effector_position, dtype=np.float64)  # [x,y,z,w,x,y,z]
-            cur_xyzw = quat_to_xyzw(cur[3:7], args.robot_quat_format)
-
-            new_pos = cur[:3] + dpos
-            new_xyzw = compose_quat(cur_xyzw, drot, args.rot_order)
+                raw_drot[:] = 0.0
+            dpos, drot, substeps = command_delta(
+                raw_dpos,
+                raw_drot,
+                pos_clip=args.pos_clip,
+                rot_clip=args.rot_clip,
+                clip_mode=args.clip_mode,
+            )
 
             grip_cmd = 0.0
             if args.send_gripper:
@@ -242,28 +350,39 @@ def main() -> None:
                     last_gripper_cmd_step = i
                     grip_cmd = -1.0 if gripper_target == "open" else 1.0
 
-            cmd = np.array([
-                new_pos[0],
-                new_pos[1],
-                new_pos[2],
-                new_xyzw[0],
-                new_xyzw[1],
-                new_xyzw[2],
-                new_xyzw[3],
-                grip_cmd,
-            ])
+            substep_period = period / substeps
+            for substep in range(substeps):
+                rs = robot.read_state()
+                cur = np.asarray(rs.end_effector_position, dtype=np.float64)
+                cur_xyzw = quat_to_xyzw(cur[3:7], args.robot_quat_format)
 
-            if args.verbose:
-                print(
-                    f"[step {i}] dpos={dpos} drot={drot} grip={grip_cmd} "
-                    f"w_next={float(state[i + 1, 7]):.5f} target={gripper_target}"
+                new_pos = cur[:3] + dpos
+                new_xyzw = compose_quat(cur_xyzw, drot, args.rot_order)
+                substep_grip_cmd = grip_cmd if substep == substeps - 1 else 0.0
+
+                cmd = np.array([
+                    new_pos[0],
+                    new_pos[1],
+                    new_pos[2],
+                    new_xyzw[0],
+                    new_xyzw[1],
+                    new_xyzw[2],
+                    new_xyzw[3],
+                    substep_grip_cmd,
+                ])
+
+                if args.verbose:
+                    print(
+                        f"[step {i}.{substep + 1}/{substeps}] raw_dpos={raw_dpos} "
+                        f"cmd_dpos={dpos} cmd_drot={drot} grip={substep_grip_cmd} "
+                        f"w_next={float(state[i + 1, 7]):.5f} target={gripper_target}"
+                    )
+
+                robot.send_action(
+                    FR3RobotAction(cartesian_positions=cmd.tolist(), action_mode=FR3ActionMode.ABSOLUTE),
+                    asynchronous=False,
                 )
-
-            robot.send_action(
-                FR3RobotAction(cartesian_positions=cmd.tolist(), action_mode=FR3ActionMode.ABSOLUTE),
-                asynchronous=False,
-            )
-            time.sleep(period)
+                time.sleep(substep_period)
 
     finally:
         try:
